@@ -1,17 +1,18 @@
 org: javiercastro
 service: sistema-pedidos-serverless
-frameworkVersion: "3"
+frameworkVersion: "4"
 
 provider:
   name: aws
   runtime: python3.13
   region: us-east-1
+  profile: default
   stage: ${opt:stage, 'dev'}
   memorySize: 1024
   timeout: 30
   logRetentionInDays: 14
   iam:
-    role: arn:aws:iam::992305442253:role/LabRole
+    role: arn:aws:iam::${aws:accountId}:role/LabRole
   environment:
     ORDERS_TABLE: !Ref OrdersTable
     CATALOG_TABLE: !Ref CatalogTable
@@ -248,7 +249,12 @@ resources:
       Type: AWS::StepFunctions::StateMachine
       Properties:
         StateMachineName: ${self:service}-${sls:stage}-workflow
-        RoleArn: arn:aws:iam::992305442253:role/LabRole
+        RoleArn:
+          Fn::Join:
+            - ""
+            - - "arn:aws:iam::"
+              - !Ref AWS::AccountId
+              - ":role/LabRole"
         Definition:
           Comment: Human order fulfillment workflow
           StartAt: ReceiveOrder

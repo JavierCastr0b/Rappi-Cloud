@@ -8,6 +8,6 @@
     "package": "serverless package"
   },
   "devDependencies": {
-    "serverless": "^3.40.0"
+    "serverless": "^4.0.4"
   }
 }
