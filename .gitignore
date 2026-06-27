@@ -1,0 +1,8 @@
+node_modules/
+.serverless/
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.DS_Store
+

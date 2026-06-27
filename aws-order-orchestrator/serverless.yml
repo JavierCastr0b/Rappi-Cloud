@@ -1,0 +1,383 @@
+org: javiercastro
+service: sistema-pedidos-serverless
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: python3.13
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  memorySize: 1024
+  timeout: 30
+  logRetentionInDays: 14
+  iam:
+    role: arn:aws:iam::992305442253:role/LabRole
+  environment:
+    ORDERS_TABLE: !Ref OrdersTable
+    CATALOG_TABLE: !Ref CatalogTable
+    TASKS_TABLE: !Ref WorkflowTasksTable
+    IDENTITY_TABLE: !Ref IdentityTable
+    TOKEN_TTL_SECONDS: 86400
+    EVENT_BUS_NAME: !Ref OrdersEventBus
+    EVIDENCE_BUCKET: !Ref EvidenceBucket
+    PARTNER_CALLBACK_URL: ${param:partnerCallbackUrl, ''}
+    PARTNER_SHARED_SECRET: ${param:partnerSharedSecret, ''}
+  apiGateway:
+    minimumCompressionSize: 1024
+  tags:
+    Project: OrderManagement
+    Environment: ${sls:stage}
+
+package:
+  patterns:
+    - src/**
+    - "!**/__pycache__/**"
+    - "!tests/**"
+
+functions:
+  register:
+    handler: src/identity/handlers.register
+    events:
+      - http:
+          path: auth/register
+          method: post
+          cors: true
+
+  login:
+    handler: src/identity/handlers.login
+    events:
+      - http:
+          path: auth/login
+          method: post
+          cors: true
+
+  logout:
+    handler: src/identity/handlers.logout
+    events:
+      - http:
+          path: auth/logout
+          method: post
+          cors: true
+          authorizer: &tokenAuthorizer
+            name: authorize
+            type: request
+            identitySource: method.request.header.Authorization
+            resultTtlInSeconds: 0
+
+  authorize:
+    handler: src/identity/handlers.authorize
+
+  createOrder:
+    handler: src/orders/handlers.create_order
+    events:
+      - http:
+          path: orders
+          method: post
+          cors: true
+          authorizer: *tokenAuthorizer
+
+  getOrder:
+    handler: src/orders/handlers.get_order
+    events:
+      - http:
+          path: orders/{order_id}
+          method: get
+          cors: true
+          authorizer: *tokenAuthorizer
+
+  listOrders:
+    handler: src/orders/handlers.list_orders
+    events:
+      - http:
+          path: orders
+          method: get
+          cors: true
+          authorizer: *tokenAuthorizer
+
+  evidenceUpload:
+    handler: src/orders/handlers.create_evidence_upload
+    events:
+      - http:
+          path: orders/{order_id}/evidence-upload
+          method: post
+          cors: true
+          authorizer: *tokenAuthorizer
+
+  createProduct:
+    handler: src/catalog/handlers.create_product
+    events:
+      - http:
+          path: catalog
+          method: post
+          cors: true
+          authorizer: *tokenAuthorizer
+
+  listCatalog:
+    handler: src/catalog/handlers.list_catalog
+    events:
+      - http:
+          path: catalog
+          method: get
+          cors: true
+          authorizer: *tokenAuthorizer
+
+  startWorkflow:
+    handler: src/workflow/handlers.start_workflow
+    environment:
+      STATE_MACHINE_ARN: !Ref OrderWorkflow
+
+  registerHumanTask:
+    handler: src/workflow/handlers.register_human_task
+
+  completeStep:
+    handler: src/workflow/handlers.complete_step
+    events:
+      - http:
+          path: orders/{order_id}/steps/{step}/complete
+          method: post
+          cors: true
+          authorizer: *tokenAuthorizer
+
+  dashboard:
+    handler: src/workflow/handlers.dashboard
+    events:
+      - http:
+          path: dashboard
+          method: get
+          cors: true
+          authorizer: *tokenAuthorizer
+
+  notifyPartner:
+    handler: src/workflow/handlers.notify_partner
+
+resources:
+  Resources:
+    OrdersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${sls:stage}-orders
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: tenant_id
+            AttributeType: S
+          - AttributeName: order_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tenant_id
+            KeyType: HASH
+          - AttributeName: order_id
+            KeyType: RANGE
+
+    CatalogTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${sls:stage}-catalog
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: tenant_id
+            AttributeType: S
+          - AttributeName: product_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tenant_id
+            KeyType: HASH
+          - AttributeName: product_id
+            KeyType: RANGE
+
+    WorkflowTasksTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${sls:stage}-workflow-tasks
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: order_id
+            AttributeType: S
+          - AttributeName: step
+            AttributeType: S
+        KeySchema:
+          - AttributeName: order_id
+            KeyType: HASH
+          - AttributeName: step
+            KeyType: RANGE
+
+    IdentityTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${sls:stage}-identity
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: record_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: record_id
+            KeyType: HASH
+        TimeToLiveSpecification:
+          AttributeName: expires_at
+          Enabled: true
+
+    OrdersEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:service}-${sls:stage}-events
+
+    EvidenceBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:service}-${sls:stage}-evidence-${aws:accountId}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        LifecycleConfiguration:
+          Rules:
+            - Id: ArchiveEvidence
+              Status: Enabled
+              ExpirationInDays: 90
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders:
+                - "*"
+              AllowedMethods:
+                - PUT
+              AllowedOrigins:
+                - "*"
+              MaxAge: 3600
+
+    OrderWorkflow:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        StateMachineName: ${self:service}-${sls:stage}-workflow
+        RoleArn: arn:aws:iam::992305442253:role/LabRole
+        Definition:
+          Comment: Human order fulfillment workflow
+          StartAt: ReceiveOrder
+          States:
+            ReceiveOrder:
+              Type: Task
+              Resource: arn:aws:states:::lambda:invoke.waitForTaskToken
+              Parameters:
+                FunctionName: !GetAtt RegisterHumanTaskLambdaFunction.Arn
+                Payload:
+                  taskToken.$: $$.Task.Token
+                  tenant_id.$: $.tenant_id
+                  order_id.$: $.order_id
+                  origin.$: $.origin
+                  step: RECEIVED
+              TimeoutSeconds: 86400
+              Next: CookOrder
+            CookOrder:
+              Type: Task
+              Resource: arn:aws:states:::lambda:invoke.waitForTaskToken
+              Parameters:
+                FunctionName: !GetAtt RegisterHumanTaskLambdaFunction.Arn
+                Payload:
+                  taskToken.$: $$.Task.Token
+                  tenant_id.$: $.tenant_id
+                  order_id.$: $.order_id
+                  origin.$: $.origin
+                  step: COOKING
+              TimeoutSeconds: 86400
+              Next: PackOrder
+            PackOrder:
+              Type: Task
+              Resource: arn:aws:states:::lambda:invoke.waitForTaskToken
+              Parameters:
+                FunctionName: !GetAtt RegisterHumanTaskLambdaFunction.Arn
+                Payload:
+                  taskToken.$: $$.Task.Token
+                  tenant_id.$: $.tenant_id
+                  order_id.$: $.order_id
+                  origin.$: $.origin
+                  step: PACKING
+              TimeoutSeconds: 86400
+              Next: DispatchOrder
+            DispatchOrder:
+              Type: Task
+              Resource: arn:aws:states:::lambda:invoke.waitForTaskToken
+              Parameters:
+                FunctionName: !GetAtt RegisterHumanTaskLambdaFunction.Arn
+                Payload:
+                  taskToken.$: $$.Task.Token
+                  tenant_id.$: $.tenant_id
+                  order_id.$: $.order_id
+                  origin.$: $.origin
+                  step: ON_THE_WAY
+              TimeoutSeconds: 86400
+              Next: DeliverOrder
+            DeliverOrder:
+              Type: Task
+              Resource: arn:aws:states:::lambda:invoke.waitForTaskToken
+              Parameters:
+                FunctionName: !GetAtt RegisterHumanTaskLambdaFunction.Arn
+                Payload:
+                  taskToken.$: $$.Task.Token
+                  tenant_id.$: $.tenant_id
+                  order_id.$: $.order_id
+                  origin.$: $.origin
+                  step: DELIVERED
+              TimeoutSeconds: 86400
+              End: true
+
+    OrderCreatedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        EventBusName: !Ref OrdersEventBus
+        EventPattern:
+          source:
+            - com.orderplatform.orders
+          detail-type:
+            - OrderCreated
+        Targets:
+          - Arn: !GetAtt StartWorkflowLambdaFunction.Arn
+            Id: StartOrderWorkflow
+
+    AllowEventBridgeStartWorkflow:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !Ref StartWorkflowLambdaFunction
+        Principal: events.amazonaws.com
+        SourceArn: !GetAtt OrderCreatedRule.Arn
+
+    OrderStatusRule:
+      Type: AWS::Events::Rule
+      Properties:
+        EventBusName: !Ref OrdersEventBus
+        EventPattern:
+          source:
+            - com.orderplatform.orders
+          detail-type:
+            - OrderStatusChanged
+        Targets:
+          - Arn: !GetAtt NotifyPartnerLambdaFunction.Arn
+            Id: NotifyDeliveryPartner
+            RetryPolicy:
+              MaximumRetryAttempts: 3
+              MaximumEventAgeInSeconds: 3600
+
+    AllowEventBridgeNotifyPartner:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !Ref NotifyPartnerLambdaFunction
+        Principal: events.amazonaws.com
+        SourceArn: !GetAtt OrderStatusRule.Arn
+
+  Outputs:
+    ApiBaseUrl:
+      Value:
+        Fn::Join:
+          - ""
+          - - https://
+            - !Ref ApiGatewayRestApi
+            - .execute-api.
+            - !Ref AWS::Region
+            - .amazonaws.com/
+            - ${sls:stage}
+    WorkflowArn:
+      Value: !Ref OrderWorkflow
+    EvidenceBucketName:
+      Value: !Ref EvidenceBucket
+    IdentityTableName:
+      Value: !Ref IdentityTable
